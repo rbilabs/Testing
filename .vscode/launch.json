@@ -1,0 +1,62 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch Built Application",
+      "program": "${workspaceRoot}/dist/index.js",
+      "envFile": "${workspaceRoot}/.vscode/.env",
+      "skipFiles": ["${workspaceRoot}/node_modules/**/*", "<node_internals>/**/*"],
+      "preLaunchTask": "Build"
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch w/ ts-node",
+      "protocol": "inspector",
+      "args": ["${workspaceRoot}/src/index.ts"],
+      "cwd": "${workspaceRoot}",
+      "envFile": "${workspaceRoot}/.vscode/.env",
+      "runtimeArgs": ["-r", "ts-node/register"],
+      "internalConsoleOptions": "openOnSessionStart",
+      "outFiles": ["${workspaceRoot}/dist/**/*.js"],
+      "skipFiles": ["${workspaceRoot}/node_modules/**/*", "<node_internals>/**/*"]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch File w/ ts-node",
+      "protocol": "inspector",
+      "args": ["${relativeFile}"],
+      "cwd": "${workspaceRoot}",
+      "envFile": "${workspaceRoot}/.vscode/.env",
+      "runtimeArgs": ["-r", "ts-node/register"],
+      "internalConsoleOptions": "openOnSessionStart",
+      "outFiles": ["${workspaceRoot}/dist/**/*.js"],
+      "skipFiles": ["${workspaceRoot}/node_modules/**/*", "<node_internals>/**/*"]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Test Spec File w/ ts-node",
+      "protocol": "inspector",
+      "program": "${workspaceRoot}/node_modules/jest/bin/jest.js",
+      "args": [
+        "${fileBasenameNoExtension}",
+        "--runInBand",
+        "--colors",
+        "--verbose=false",
+        "--collectCoverage=false",
+        "--config",
+        "${workspaceRoot}/jest.config.js"
+      ],
+      "osx": {
+        "console": "integratedTerminal"
+      },
+      "envFile": "${workspaceRoot}/.vscode/.env",
+      "skipFiles": ["${workspaceRoot}/node_modules/**/*", "<node_internals>/**/*"],
+      "disableOptimisticBPs": true
+    }
+  ]
+}

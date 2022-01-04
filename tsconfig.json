@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2018",
+    "lib": ["dom", "es2018", "esnext.asynciterable"],
+    "module": "commonjs",
+    "strict": true,
+    "removeComments": false,
+    "sourceMap": true,
+    "moduleResolution": "node",
+    "declaration": true,
+    "baseUrl": "./",
+    "esModuleInterop": true,
+    "preserveSymlinks": true,
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "paths": {
+      "*": ["src/@types/*"]
+    },
+    "types": [
+      "jest",
+      "node"
+    ]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "**/*.d.ts"]
+}

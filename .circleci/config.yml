@@ -1,0 +1,614 @@
+version: 2.1
+
+description: Template service
+
+references:
+  ecr_auth: &ecr_auth
+    aws_access_key_id: $ECR_AWS_ACCESS_KEY_ID
+    aws_secret_access_key: $ECR_AWS_SECRET_ACCESS_KEY
+  master_workflow_filters: &master_workflow_filters
+    branches:
+      only: master
+  pr_workflow_filters: &pr_workflow_filters
+    branches:
+      ignore: master
+  prod_workflow_filters: &prod_workflow_filters
+    tags:
+      only: /^prod-.*/
+    branches:
+      ignore: /.*/
+  qa_workflow_filters: &qa_workflow_filters
+    tags:
+      only: /^qa-.*/
+    branches:
+      ignore: /.*/
+  ssh_keys: &ssh_keys
+    fingerprints:
+      - '6a:77:14:7c:c4:01:9d:21:4a:ad:e7:69:3d:97:e8:9f'
+  staging_workflow_filters: &staging_workflow_filters
+    tags:
+      only: /^staging-.*/
+    branches:
+      ignore: /.*/
+
+executors:
+  nodejs:
+    docker:
+      - image: 880659461790.dkr.ecr.us-east-1.amazonaws.com/rbi/nodejs:12.20.1.0
+        aws_auth: *ecr_auth
+  terraform:
+    docker:
+      - image: 880659461790.dkr.ecr.us-east-1.amazonaws.com/rbi/terraform:0.13.5.1
+        aws_auth: *ecr_auth
+
+orbs:
+  sonarcloud: sonarsource/sonarcloud@1.0.2
+  slack: rbilabs/slack@4.0.0
+  jira: circleci/jira@1.2.2
+
+# Pipeline workflow parameters for API
+parameters:
+  trigger:
+    type: enum
+    enum: ['default', 'update-packages']
+    default: 'default'
+  version:
+    type: string
+    default: ''
+
+commands:
+  restore_caches:
+    steps:
+      - restore_cache:
+          keys:
+            - yarn-cache-v1-{{ checksum "yarn.lock" }}
+      - restore_cache:
+          keys:
+            - build-cache-v1-{{ .Revision }}
+  save_caches:
+    steps:
+      - save_cache:
+          name: Save node_modules
+          key: yarn-cache-v1-{{ checksum "yarn.lock" }}
+          paths:
+            - node_modules
+      - save_cache:
+          name: Save build artifact
+          key: build-cache-v1-{{ .Revision }}
+          paths:
+            - dist
+
+  notify_on_fail:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branches: '^rbibot\/rbilabs\/.*'
+          channel: C015MAJ8SMN
+          failure_message: 'Automated check for packages ${CIRCLE_BRANCH} failed: ${PULL_REQUEST_URL}'
+          webhook: https://hooks.slack.com/services/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
+
+jobs:
+  build:
+    executor: nodejs
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Skip build if cached build found
+          command: |
+            if [[ -d node_modules ]] && [[ -d dist ]]
+            then
+              echo "Cached build found, skipping job"
+              circleci step halt
+            else
+              echo "No cached build found, installing dependencies and building"
+            fi
+      - run:
+          name: Configure npmrc
+          command: echo "//npm.pkg.github.com/:_authToken=$GH_NPM_TOKEN" > ~/.npmrc
+      - run:
+          name: Build
+          command: |
+            yarn install --frozen-lockfile
+            yarn build
+      - save_caches
+      - notify_on_fail
+
+  jira-notify:
+    docker:
+      - image: 'circleci/node:12.20.1-browsers'
+    parameters:
+      environment:
+        type: string
+      environment_type:
+        type: string
+        default: development
+    steps:
+      - checkout
+      - jira/notify:
+          environment: << parameters.environment >>
+          environment_type: << parameters.environment_type >>
+          job_type: deployment
+          token_name: JIRA_TOKEN
+
+  tag:
+    executor: nodejs
+    parameters:
+      stage:
+        type: string
+    steps:
+      - checkout
+      - add_ssh_keys: *ssh_keys
+      - run:
+          command: |
+            git config user.email "rbi.ctg.eng@gmail.com"
+            git config user.name "CircleCI"
+            yarn release << parameters.stage >>
+
+  lint:
+    executor: nodejs
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Lint
+          command: yarn lint
+      - notify_on_fail
+
+  test:
+    executor: nodejs
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Unit Tests
+          command: |-
+            yarn test --ci --maxWorkers 2 --reporters=default --reporters=jest-junit
+          environment:
+            JEST_JUNIT_OUTPUT_DIR: /tmp/reports/junit/
+      - store_test_results:
+          path: /tmp/reports/junit/
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - project/coverage/lcov.info
+      - notify_on_fail
+
+  test-integration:
+    executor: nodejs
+    parameters:
+      profile:
+        type: string
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Integration Tests
+          command: |-
+            source ci-configure-environment --profile << parameters.profile >>
+            source ci-configure-aws --prefix "$AWS_KEY_PREFIX" --profile << parameters.profile >>
+            yarn test:integration  --maxWorkers 2 --passWithNoTests --ci --reporters=default --reporters=jest-junit
+          environment:
+            JEST_JUNIT_OUTPUT_DIR: /tmp/reports/junit-integration/
+      - store_test_results:
+          path: /tmp/reports/junit-integration/
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - project/coverage-integration/lcov.info
+      - notify_on_fail
+
+  test-e2e:
+    executor: nodejs
+    parameters:
+      profile:
+        type: string
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Test End-to-End
+          command: |-
+            source ci-configure-environment --profile << parameters.profile >>
+            source ci-configure-aws --prefix "$AWS_KEY_PREFIX" --profile << parameters.profile >>
+            yarn test:e2e --maxWorkers 2 --passWithNoTests --ci
+      - notify_on_fail
+
+  deploy:
+    executor: nodejs
+    parameters:
+      profile:
+        type: string
+    steps:
+      - checkout
+      - restore_caches
+      - run:
+          name: Deploy serverless package
+          command: |
+            export BRAND=$(echo << parameters.profile >> | cut -d'.' -f 3)
+            source ci-configure-aws --prefix "$AWS_KEY_PREFIX" --profile << parameters.profile >>
+
+            DSTAGE=${CIRCLE_PULL_REQUEST:+"preview-${CIRCLE_PULL_REQUEST##*/}"}
+            yarn sls deploy --stage ${DSTAGE:-$STAGE}
+            ci-datadog-deploy-event --brand "$BRAND" --stage "$STAGE"
+      - notify_on_fail
+
+  sonarcloud:
+    docker:
+      - image: circleci/node:12.20.1
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - yarn-cache-v1-{{ checksum "yarn.lock" }}
+      - attach_workspace:
+          at: ~/
+      - run: |
+          echo "export SONAR_SCANNER_OPTS=\"-Xmx3g\"" >> "$BASH_ENV"
+          echo "export NODE_OPTIONS=\"--max-old-space-size=6144\"" >> "$BASH_ENV"
+      - sonarcloud/scan
+      - notify_on_fail
+
+  tfe-plan:
+    executor: terraform
+    parameters:
+      profile:
+        type: string
+    steps:
+      - checkout
+      - run: ci-skip-if-unchanged -p .aws
+      - run:
+          name: Test a Terraform plan
+          command: |
+            source ci-configure-aws --prefix "$AWS_KEY_PREFIX" -p << parameters.profile >>
+            tfe-assume-role -w rbi-ctg-dev-template -p << parameters.profile >>
+            cd .aws/live/dev
+            terraform init -input=false -backend-config="token=${TFE_TOKEN}"
+            terraform plan
+      - notify_on_fail
+
+  tfe-apply:
+    executor: terraform
+    parameters:
+      profile:
+        type: string
+    steps:
+      - checkout
+      - run: ci-skip-if-unchanged -p .aws
+      - run: tfe-auto-apply -w template -p << parameters.profile >>
+      - notify_on_fail
+
+  # Autoupdate @rbilabs packages
+  update-packages:
+    executor: nodejs
+    steps:
+      - checkout
+      - add_ssh_keys: *ssh_keys
+      - run: |
+          echo "//npm.pkg.github.com/:_authToken=$GH_NPM_TOKEN" > ~/.npmrc
+          ci-update-packages << pipeline.parameters.version >>
+
+  # Automerge the current branch into master
+  automerge:
+    executor: nodejs
+    steps:
+      - checkout
+      - add_ssh_keys: *ssh_keys
+      - run: ci-automerge
+
+workflows:
+  # Remotely triggered packages update
+  update-packages:
+    when:
+      equal: [<< pipeline.parameters.trigger >>, 'update-packages']
+    jobs:
+      - update-packages:
+          context: rbi.bot
+          filters:
+            branches:
+              only: master
+
+  pull-request:
+    jobs:
+      - build:
+          context: rbi.dev
+          filters: *pr_workflow_filters
+      - lint:
+          requires:
+            - build
+      - test:
+          requires:
+            - build
+      - test-integration:
+          name: test-integration-pr
+          context: rbi.dev
+          filters: *pr_workflow_filters
+          profile: rbi.dev.ci
+          requires:
+            - build
+      - tfe-plan:
+          name: tfe-plan-dev
+          context: rbi.dev
+          filters: *pr_workflow_filters
+          profile: rbi.dev.ci
+      - sonarcloud:
+          context: SonarCloud
+          requires:
+            - lint
+            - test
+            - test-integration-pr
+      - deploy:
+          name: deploy-<< matrix.profile >>
+          context: rbi.dev
+          matrix:
+            parameters:
+              profile: [rbi.dev.bk.ci, rbi.dev.plk.ci, rbi.dev.th.ci, rbi.dev.ltw.ci]
+          requires:
+            - build
+            - tfe-plan-dev
+          filters:
+            branches:
+              ignore:
+                - /^rbibot\/rbilabs\/.*/
+                - /^dependabot\/.*/
+      - test-e2e:
+          name: test-e2e-pr-<< matrix.profile >>
+          context: rbi.dev
+          filters:
+            branches:
+              ignore:
+                - master
+                - /^rbibot\/rbilabs\/.*/
+                - /^dependabot\/.*/
+          matrix:
+            parameters:
+              profile: [rbi.dev.bk.ci, rbi.dev.plk.ci, rbi.dev.th.ci, rbi.dev.ltw.ci]
+          requires:
+            - tfe-plan-dev
+            - deploy-<< matrix.profile >>
+      - automerge:
+          context: rbi.dev
+          filters: &rbi-bot
+            branches:
+              only:
+                - /^rbibot\/rbilabs\/.*/
+          requires:
+            - sonarcloud
+
+  master:
+    when:
+      equal: [<< pipeline.parameters.trigger >>, 'default']
+    jobs:
+      - build:
+          context: rbi.dev
+          filters: *master_workflow_filters
+      - lint:
+          requires:
+            - build
+      - test:
+          requires:
+            - build
+      - tfe-apply:
+          name: tfe-apply-master
+          context: rbi.dev
+          profile: rbi.dev.ci
+          filters: *master_workflow_filters
+      - test-integration:
+          name: test-integration-dev
+          context: rbi.dev
+          profile: rbi.dev.ci
+          filters: *master_workflow_filters
+          requires:
+            - build
+      - sonarcloud:
+          context: SonarCloud
+          requires:
+            - lint
+            - test
+            - test-integration-dev
+      - deploy:
+          name: deploy-<< matrix.profile >>
+          context: rbi.dev
+          matrix:
+            parameters:
+              profile: [rbi.dev.bk.ci, rbi.dev.plk.ci, rbi.dev.th.ci, rbi.dev.ltw.ci]
+          requires:
+            - build
+            - tfe-apply-master
+      - jira-notify:
+          name: jira-notify-dev
+          context: rbi.dev
+          environment: dev
+          environment_type: development
+          filters: *master_workflow_filters
+          requires:
+            - deploy-rbi.dev.bk.ci
+            - deploy-rbi.dev.plk.ci
+            - deploy-rbi.dev.th.ci
+            - deploy-rbi.dev.ltw.ci
+      - test-e2e:
+          name: test-e2e-<< matrix.profile >>
+          context: rbi.dev
+          matrix:
+            parameters:
+              profile: [rbi.dev.bk.ci, rbi.dev.plk.ci, rbi.dev.th.ci, rbi.dev.ltw.ci]
+          filters: *master_workflow_filters
+          requires:
+            - deploy-<< matrix.profile >>
+      - approve-staging:
+          type: approval
+          filters: *master_workflow_filters
+          requires:
+            - deploy-rbi.dev.bk.ci
+            - deploy-rbi.dev.plk.ci
+            - deploy-rbi.dev.th.ci
+            - deploy-rbi.dev.ltw.ci
+      - tag:
+          name: tag-staging
+          filters: *master_workflow_filters
+          requires:
+            - approve-staging
+          stage: staging
+
+  staging:
+    jobs:
+      - build:
+          context: rbi.staging
+          filters: *staging_workflow_filters
+      - tfe-apply:
+          name: tfe-apply-staging
+          context: rbi.staging
+          profile: rbi.staging.ci
+          filters: *staging_workflow_filters
+      - deploy:
+          name: deploy-<< matrix.profile >>
+          context: rbi.staging
+          matrix:
+            parameters:
+              profile:
+                [rbi.staging.bk.ci, rbi.staging.plk.ci, rbi.staging.th.ci, rbi.staging.ltw.ci]
+          filters: *staging_workflow_filters
+          requires:
+            - build
+            - tfe-apply-staging
+      - approve-qa:
+          type: approval
+          filters: *staging_workflow_filters
+          requires:
+            - deploy-rbi.staging.bk.ci
+            - deploy-rbi.staging.plk.ci
+            - deploy-rbi.staging.th.ci
+            - deploy-rbi.staging.ltw.ci
+      - jira-notify:
+          name: jira-notify-staging
+          context: rbi.staging
+          environment: staging
+          environment_type: staging
+          filters: *staging_workflow_filters
+          requires:
+            - deploy-rbi.staging.bk.ci
+            - deploy-rbi.staging.plk.ci
+            - deploy-rbi.staging.th.ci
+            - deploy-rbi.staging.ltw.ci
+      - tag:
+          name: tag-qa
+          filters: *staging_workflow_filters
+          requires:
+            - approve-qa
+          stage: qa
+
+  qa:
+    jobs:
+      - build:
+          context: rbi.qa
+          filters: *qa_workflow_filters
+      - tfe-apply:
+          name: tfe-apply-<< matrix.profile >>
+          context: rbi.qa
+          matrix:
+            parameters:
+              profile: [rbi.qa.bk.ci, rbi.qa.plk.ci, rbi.qa.th.ci, rbi.qa.ltw.ci]
+          filters: *qa_workflow_filters
+      - deploy:
+          name: deploy-<< matrix.profile >>
+          context: rbi.qa
+          matrix:
+            parameters:
+              profile: [rbi.qa.bk.ci, rbi.qa.plk.ci, rbi.qa.th.ci, rbi.qa.ltw.ci]
+          filters: *qa_workflow_filters
+          requires:
+            - build
+            - tfe-apply-<< matrix.profile >>
+      - jira-notify:
+          name: jira-notify-qa-bk
+          context: rbi.qa
+          environment: qa-bk
+          environment_type: staging
+          filters: *qa_workflow_filters
+          requires:
+            - deploy-rbi.qa.bk.ci
+      - jira-notify:
+          name: jira-notify-qa-plk
+          context: rbi.qa
+          environment: qa-plk
+          environment_type: staging
+          filters: *qa_workflow_filters
+          requires:
+            - deploy-rbi.qa.plk.ci
+      - jira-notify:
+          name: jira-notify-qa-th
+          context: rbi.qa
+          environment: qa-th
+          environment_type: staging
+          filters: *qa_workflow_filters
+          requires:
+            - deploy-rbi.qa.th.ci
+      - approve-prod:
+          type: approval
+          filters: *qa_workflow_filters
+          requires:
+            - deploy-rbi.qa.bk.ci
+            - deploy-rbi.qa.plk.ci
+            - deploy-rbi.qa.th.ci
+            - deploy-rbi.qa.ltw.ci
+      - tag:
+          name: tag-prod
+          filters: *qa_workflow_filters
+          requires:
+            - approve-prod
+          stage: prod
+
+  prod:
+    jobs:
+      - build:
+          context: rbi.prod
+          filters: *prod_workflow_filters
+      - tfe-apply:
+          name: tfe-apply-<< matrix.profile >>
+          context: rbi.prod
+          matrix:
+            parameters:
+              profile: [rbi.prod.bk.ci, rbi.prod.plk.ci, rbi.prod.th.ci, rbi.prod.ltw.ci]
+          filters: *prod_workflow_filters
+      - deploy:
+          name: deploy-<< matrix.profile >>
+          context: rbi.prod
+          matrix:
+            parameters:
+              profile: [rbi.prod.bk.ci, rbi.prod.plk.ci, rbi.prod.th.ci, rbi.prod.ltw.ci]
+          filters: *prod_workflow_filters
+          requires:
+            - build
+            - tfe-apply-<< matrix.profile >>
+      - jira-notify:
+          name: jira-notify-prod-bk
+          context: rbi.prod
+          environment: prod-bk
+          environment_type: production
+          filters: *prod_workflow_filters
+          requires:
+            - deploy-rbi.prod.bk.ci
+      - jira-notify:
+          name: jira-notify-prod-plk
+          context: rbi.prod
+          environment: prod-plk
+          environment_type: production
+          filters: *prod_workflow_filters
+          requires:
+            - deploy-rbi.prod.plk.ci
+      - jira-notify:
+          name: jira-notify-prod-th
+          context: rbi.prod
+          environment: prod-th
+          environment_type: production
+          filters: *prod_workflow_filters
+          requires:
+            - deploy-rbi.prod.th.ci
+      - jira-notify:
+          name: jira-notify-prod-ltw
+          context: rbi.prod
+          environment: prod-ltw
+          environment_type: production
+          filters: *prod_workflow_filters
+          requires:
+            - deploy-rbi.prod.ltw.ci

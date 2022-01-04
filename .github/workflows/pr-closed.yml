@@ -1,0 +1,81 @@
+name: Cleanup PR Preview
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+jobs:
+  install:
+    name: Install
+    if: "!startsWith(github.head_ref, 'dependabot/') && !startsWith(github.head_ref, 'rbibot/rbilabs/')"
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: "12.20.1"
+          registry-url: "https://npm.pkg.github.com/"
+      - name: Get Yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn cache dir)"
+      - name: Restore Yarn cache
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Install dependencies from cache
+        run: yarn install --prefer-offline --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_TOKEN }}
+  cleanup:
+    name: Cleanup ${{ matrix.brand }}
+    if: "!startsWith(github.head_ref, 'dependabot/') && !startsWith(github.head_ref, 'rbibot/rbilabs/')"
+    runs-on: ubuntu-18.04
+    needs: [install]
+    strategy:
+      fail-fast: false
+      matrix:
+        brand: [bk, plk, th]
+    steps: 
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: "12.20.1"
+          registry-url: "https://npm.pkg.github.com/"
+      - name: Get Yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn cache dir)"
+      - name: Restore Yarn cache
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Install dependencies from cache
+        run: yarn install --prefer-offline --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.CI_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CI_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::326165771931:role/rbi/admin
+          role-skip-session-tagging: true
+          role-duration-seconds: 900
+      - name: Destroy BK Preview
+        run: yarn sls remove --stage "preview-$PR_NUMBER"
+        env:
+          AWS_REGION: us-east-1
+          BRAND: ${{ matrix.brand }}
+          NODE_ENV: dev
+          SERVICE_NAME: rbi
+          PR_NUMBER: ${{github.event.number}}

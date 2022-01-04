@@ -1,0 +1,73 @@
+service: ${self:custom.stackName}
+
+plugins:
+  - serverless-pseudo-parameters
+  - serverless-plugin-datadog
+  - serverless-plugin-tracing
+  - serverless-jetpack
+  - '@rbilabs/serverless-jetpack'
+
+custom:
+  # build time variables
+  awsAccountSecrets: ${ssm:/aws/reference/secretsmanager/rbi/account/aws-account~true}
+  brand: ${env:BRAND}
+  region: ${env:AWS_REGION, 'us-east-1'}
+  stage: ${env:NODE_ENV, 'dev'}
+  service: ${env:SERVICE_NAME, 'rbi'}
+
+  # custom variables
+  prefix: ${self:custom.service}-${opt:stage, self:custom.stage}-${self:custom.brand}-template
+  stackName: sls-${self:custom.prefix}
+
+  # Datadog plugin configuration
+  datadog:
+    apiKey: ${self:custom.awsAccountSecrets.datadog.apiKey}
+    site: ${self:custom.awsAccountSecrets.datadog.site}
+    addExtension: true
+
+# Common provider configuration for functions
+provider:
+  name: aws
+  runtime: nodejs12.x
+  region: ${self:custom.region}
+  stackName: ${self:custom.stackName}
+  apiName: ${self:custom.stackName}
+  stage: ${self:custom.stage}
+  timeout: 30
+  memorySize: 2048
+  versionFunctions: false
+
+  # Injected environment variables for execution
+  environment:
+    AWS_ACCOUNT_ID: '#{AWS::AccountId}'
+    BRAND: ${self:custom.brand}
+    DD_API_KEY: ${self:custom.awsAccountSecrets.datadog.apiKey}
+    DISABLE_DDB_RETRY: 'false'
+    DYNAMODB_TABLE: aws-${self:custom.service}-${self:custom.stage}-${self:custom.brand}
+    NODE_ENV: ${self:custom.stage}
+    SERVICE_NAME: ${self:custom.service}
+
+  # custom tracking for logging
+  tags:
+    'rbi:brand': ${self:custom.brand}
+    'rbi:stage': ${self:custom.stage}
+    'rbi:service': template-service
+
+  # IAM role for execution
+  role: ${ssm:/rbi/${self:custom.stage}/${self:custom.brand}/template-service/lambda-role-arn}
+
+# Package all functions in their own zip files
+package:
+  individually: true
+
+# Common configuration for functions
+defaults: &defaults
+  layers:
+    - arn:aws:lambda:#{AWS::Region}:464622532012:layer:Datadog-Node12-x:3
+  logSubscription: true
+
+functions:
+  hello:
+    <<: *defaults
+    name: ${self:custom.stackName}-hello
+    handler: dist/functions/hello/index.handler

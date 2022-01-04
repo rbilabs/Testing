@@ -1,0 +1,10 @@
+node_modules
+coverage
+coverage-integration
+dist
+build
+.serverless
+.webpackCache
+.webpack
+.terraform
+*.tfstate
